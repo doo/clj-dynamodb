@@ -23,7 +23,8 @@
 
 (def basic-request
   {:request-method :post
-   :scheme :https
+   :scheme "https"
+   :server-port 443
    :uri "/"
    :headers default-headers})
 
