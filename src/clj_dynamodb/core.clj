@@ -124,7 +124,7 @@
 (defn batch-put-request [item & [id]]
   (let [r {:put-request {:item item}}]
     (if id
-      (assoc r :id id)
+      (assoc-in r [:put-request :id] id)
       r)))
 
 (defn basic-batch-write-item-request [batch-request-items]
