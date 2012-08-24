@@ -3,9 +3,15 @@
   (:require [clj-dynamodb.convert.to-dynamodb :as dyn]
             [clj-dynamodb.convert.to-clojure :as clj]
             [cheshire.core :as json]
-            [aws-signature-v4.signing :as signature]))
+            [aws-signature-v4.signing :as signature]
+            [lamina.core.result :as r]
+            [lamina.core :as l]
+            [aleph.http :as a])
+  (:import org.jboss.netty.buffer.ChannelBufferInputStream))
 
 (def ^:dynamic dynamodb-api-version "DynamoDB_20111205")
+
+(def ^:dynamic dynamodb-batch-size 25)
 
 (def default-content-type "application/x-amz-json-1.0")
 
@@ -89,22 +95,17 @@
 (defn ok? [resp]
   (= (:status resp) 200))
 
-(defn request-with-exponential-backoff [client max-number-of-retries req]
-  (loop [r 0]
-    (let [resp (client req)]        
-      (if (and (or (server-error-response? resp)
-                   (and (client-error-response? resp)                        
-                        (provisioned-throughput-exceeded-error-response?
-                         (parse-body resp))))
-               (< r max-number-of-retries))
-        (do
-          (Thread/sleep (* (long (Math/pow 2 r)) 50))
-          (recur (inc r)))
-        (assoc-in resp [:aws :request-retries] r)))))
+(defn retry-request? [response]
+  (or (server-error-response? response)
+      (and (client-error-response? response)
+           (provisioned-throughput-exceeded-error-response?
+            (parse-body response)))))
 
-(defn wrap-client-with-exponential-backoff [client max-number-of-retries]
-  (fn [req]
-    (request-with-exponential-backoff client max-number-of-retries req)))
+(defn exponential-backoff [n]
+  (* (long (Math/pow 2 n)) 50))
+
+(defn remove-host-header [request]
+  (update-in request [:headers] dissoc "host"))
 
 (defn basic-get-item-request [table-name hash-key]
   (let [body {:table-name table-name
@@ -132,11 +133,103 @@
       (assoc :body {:request-items batch-request-items})
       (add-target :batch-write-item)))
 
-(defn batch-write-items [client prepare-request batch-write-item-request]
-  (loop [n 1
-         request (prepare-request batch-write-item-request)]
-    (let [response (client request)
-          unprocessed-items (get (:body (parse-body response)) "UnprocessedItems")]  
-      (if (or (empty? unprocessed-items))
-        (assoc-in response [:aws :batch-cycles] n)
-        (recur (inc n) (prepare-request (basic-batch-write-item-request unprocessed-items)))))))
+(defn handle-error-response [response]
+  (if (or (client-error-response? response)
+            (server-error-response? response))
+    (throw (Exception. (String. (:body response))))
+    response))
+
+;;TODO: use slingshot here (client error und server error exception)
+
+
+;; convert body
+
+(defn slurp-channel-buffer
+  "Converts an org.jboss.netty.buffer.ChannelBuffer into a string."
+  [channel-buffer]
+  (slurp (ChannelBufferInputStream. channel-buffer)))
+
+(defn body-channel-as-string
+  "Converts a closed channel filled with org.jboss.netty.buffer.ChannelBuffer(s) into
+   a string."
+  [channel]
+  (reduce
+   (fn [r s] (str r (slurp-channel-buffer s)))
+   "" (l/channel-seq channel)))
+
+(defn body-to-string
+  "Converts the body of an Aleph HTTP response map into a string. The response
+   is either an org.jboss.netty.buffer.ChannelBuffer or a channel filled with
+   ChannelBuffer(s) (in the case of a HTTP chunked transfer encoding)"
+  [req]
+  (update-in
+   req [:body]
+   (fn [body]
+     (if (l/channel? body)
+       (body-channel-as-string body)
+       (slurp-channel-buffer body)))))
+
+(defn delay-request [request]
+  (if-let [wait (get-in request [:aws :delay])]
+    (r/timed-result wait request)
+    request))
+
+(def http-request
+  (l/pipeline
+   remove-host-header
+   delay-request
+   a/http-request
+   body-to-string))
+
+(def http-execute-with-exponential-backoff
+  (l/pipeline
+   (fn [request] (l/merge-results request (http-request request)))
+   (fn [[request response]]
+     (let [aws (:aws request)
+           n (:request-retries aws 0)
+           max-number-of-retries (:max-number-of-retries aws -1)]
+       (if (and (retry-request? response)
+                (or (= max-number-of-retries -1)
+                    (< n max-number-of-retries)))
+         (let [eb (exponential-backoff n)
+               request (update-in request [:aws] assoc
+                                  :delay eb
+                                  :request-retries (inc n))]
+           ;;(println "restart" n "in" eb) ;; TODO: replace with lamina trace
+           (l/restart request))
+         (assoc-in response [:aws :request-retries] n))))))
+
+(defn batch-write-items [prepare-request batch-write-item-request]
+  (l/run-pipeline
+   batch-write-item-request
+   (fn [request] (prepare-request request))
+   http-execute-with-exponential-backoff
+   (fn [response]
+     (let [response (handle-error-response response)
+           unprocessed-items (get (json/parse-string (:body response))
+                                  "UnprocessedItems")]
+       ;;(println "unprocessed" unprocessed-items) ;;TODO replace through lamina trace
+       (if (empty? unprocessed-items)
+         response
+         (l/restart (basic-batch-write-item-request unprocessed-items)))))))
+
+(defn group-batch-items-by-table [batch-items]
+  (into {}
+        (map (fn [[k v]] [k (map #(dissoc % :table) v)])
+             (group-by :table batch-items))))
+
+(defn prepare-batch-items [batch-items]
+  (->> batch-items
+       (sort-by :table)
+       (partition-all dynamodb-batch-size)
+       (map group-batch-items-by-table)))
+
+(defn mass-batch-write-items [prepare-request batch-items]
+  (let [batches (prepare-batch-items batch-items)]
+    (apply l/merge-results
+           (map (fn [batch]
+                  (let [req (basic-batch-write-item-request batch)]
+                    (batch-write-items
+                     prepare-request
+                     req)))
+                batches))))
