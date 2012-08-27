@@ -11,11 +11,13 @@
 
 (def ^:dynamic dynamodb-api-version "DynamoDB_20111205")
 
-(def ^:dynamic dynamodb-batch-size 25)
+(def ^:dynamic dynamodb-batch-write-size 25)
 
-(def default-content-type "application/x-amz-json-1.0")
+(def ^:dynamic dynamodb-batch-get-size 100)
 
-(def default-headers {"Content-Type" default-content-type})
+(def ^:dynamic default-content-type "application/x-amz-json-1.0")
+
+(def ^:dynamic default-headers {"Content-Type" default-content-type})
 
 (defn amz-target
   "Returns an appropriate x-amz-target header value for the given
@@ -133,6 +135,30 @@
       (assoc :body {:request-items batch-request-items})
       (add-target :batch-write-item)))
 
+(defn table-key [hash-key & [range-key]]
+  (let [m {:hash-key-element hash-key}]
+    (if range-key
+      (assoc m :range-key-element range-key)
+      m)))
+
+(defn batch-get-request
+  ([table-name keys]
+     {table-name
+      {:keys keys}})
+  ([table-name keys attributes-to-get]
+     (assoc (batch-get-request table-name keys)
+       :attributes-to-get attributes-to-get)))
+
+(defn basic-batch-write-item-request [batch-request-items]
+  (-> basic-request
+      (assoc :body {:request-items batch-request-items})
+      (add-target :batch-write-item)))
+
+(defn basic-batch-get-item-request [batch-request-items]
+  (-> basic-request
+      (assoc :body {:request-items batch-request-items})
+      (add-target :batch-get-item)))
+
 (defn handle-error-response [response]
   (if (or (client-error-response? response)
             (server-error-response? response))
@@ -141,7 +167,6 @@
 
 ;;TODO: use slingshot here (client error und server error exception)
 
-
 ;; convert body
 
 (defn slurp-channel-buffer
@@ -149,24 +174,17 @@
   [channel-buffer]
   (slurp (ChannelBufferInputStream. channel-buffer)))
 
-(defn body-channel-as-string
-  "Converts a closed channel filled with org.jboss.netty.buffer.ChannelBuffer(s) into
-   a string."
-  [channel]
-  (reduce
-   (fn [r s] (str r (slurp-channel-buffer s)))
-   "" (l/channel-seq channel)))
-
 (defn body-to-string
   "Converts the body of an Aleph HTTP response map into a string. The response
    is either an org.jboss.netty.buffer.ChannelBuffer or a channel filled with
    ChannelBuffer(s) (in the case of a HTTP chunked transfer encoding)"
   [req]
   (update-in
-   req [:body]
+   req
+   [:body]
    (fn [body]
-     (if (l/channel? body)
-       (body-channel-as-string body)
+     (if (sequential? body)
+       (reduce (fn [b cb] (str b (slurp-channel-buffer cb))) "" body)
        (slurp-channel-buffer body)))))
 
 (defn delay-request [request]
@@ -174,11 +192,34 @@
     (r/timed-result wait request)
     request))
 
+(defn handle-chunked-transfer-encoding
+  "If chunked transfer encoding is used to transfer the response body, then
+   the :body entry in the map will be a lamina channel. In this case this
+   function takes care that the full body is transfered before the subsequent
+   pipeline stages continues to process the response.
+   It is very important that a separate nested pipeline is used here to consume
+   the full body. If this is done in the pipeline that handles the request and
+   response cycle, this will cause the whole pipeline to block forever.
+   The appropriate strategy to handle this situation has been found in the
+   aleph.http.core/decode-message function."
+  [{:keys [content-type character-encoding body] :as response}]
+  (if (l/channel? body)
+    (l/run-pipeline
+     (l/reduce* conj [] body)
+     ;; Another important point is that the body must be assigned in the next stage
+     ;; otherwise the channel will not be realized (or block each other), when the
+     ;; result is assigned as :body to the request. Here run-pipeline takes care that
+     ;; the full channel has been consumed by reduce* / reduced before it is assigned
+     ;; to the request map.
+     #(assoc response :body %))
+    response))
+
 (def http-request
   (l/pipeline
    remove-host-header
    delay-request
    a/http-request
+   handle-chunked-transfer-encoding
    body-to-string))
 
 (def http-execute-with-exponential-backoff
@@ -199,19 +240,34 @@
            (l/restart request))
          (assoc-in response [:aws :request-retries] n))))))
 
+(defn batch-pipeline [prepare-request]
+  (l/pipeline
+   (fn [request] (prepare-request request))
+   http-execute-with-exponential-backoff))
+
+(defn repeat-unprocessed-pipeline [extract-unprocessed create-repeat-request]
+  (fn [response]
+    (let [response (handle-error-response response)
+          body (json/parse-string (:body response))
+          unprocessed (extract-unprocessed body)]
+       ;;(println "unprocessed" unprocessed-items) ;;TODO replace through lamina trace
+       (if (empty? unprocessed)
+         response
+         (l/restart (create-repeat-request unprocessed))))))
+
 (defn batch-write-items [prepare-request batch-write-item-request]
   (l/run-pipeline
    batch-write-item-request
-   (fn [request] (prepare-request request))
-   http-execute-with-exponential-backoff
-   (fn [response]
-     (let [response (handle-error-response response)
-           unprocessed-items (get (json/parse-string (:body response))
-                                  "UnprocessedItems")]
-       ;;(println "unprocessed" unprocessed-items) ;;TODO replace through lamina trace
-       (if (empty? unprocessed-items)
-         response
-         (l/restart (basic-batch-write-item-request unprocessed-items)))))))
+   (batch-pipeline prepare-request)
+   (repeat-unprocessed-pipeline (fn [body] (get body "UnprocessedItems"))
+                                basic-batch-write-item-request)))
+
+(defn batch-get-items [prepare-request batch-get-item-request]
+  (l/run-pipeline
+   batch-get-item-request
+   (batch-pipeline prepare-request)
+   (repeat-unprocessed-pipeline (fn [body] (get body "UnprocessedKeys"))
+                                basic-batch-get-item-request)))
 
 (defn group-batch-items-by-table [batch-items]
   (into {}
@@ -221,15 +277,25 @@
 (defn prepare-batch-items [batch-items]
   (->> batch-items
        (sort-by :table)
-       (partition-all dynamodb-batch-size)
+       (partition-all dynamodb-batch-write-size)
        (map group-batch-items-by-table)))
 
+(defn mass-batch-execute [batches execute-batch]
+  (apply l/merge-results
+         (map (fn [batch]
+                (execute-batch batch)) batches)))
+
 (defn mass-batch-write-items [prepare-request batch-items]
-  (let [batches (prepare-batch-items batch-items)]
-    (apply l/merge-results
-           (map (fn [batch]
-                  (let [req (basic-batch-write-item-request batch)]
-                    (batch-write-items
-                     prepare-request
-                     req)))
-                batches))))
+  (mass-batch-execute (prepare-batch-items batch-items)
+                      (fn [batch]
+                        (batch-write-items
+                         prepare-request
+                         (basic-batch-write-item-request batch)))))
+
+(defn mass-batch-get-items [prepare-request table-name keys]
+  (mass-batch-execute (partition-all dynamodb-batch-get-size keys)
+                      (fn [keys]
+                        (batch-get-items
+                         prepare-request
+                         (basic-batch-get-item-request
+                          (batch-get-request table-name keys))))))
