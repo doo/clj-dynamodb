@@ -68,7 +68,7 @@
       signature/sign-request))
 
 (defn to-clojure [body]
-  (convert-body string? to-dashed (clj/prepare-fn clj/type-conversions #{"Item"}) body))
+  (convert-body string? to-dashed (clj/prepare-fn clj/type-conversions #{"Item" "Items"}) body))
 
 (defn to-clojure-response-body [req]
   (update-in req [:body] to-clojure))
