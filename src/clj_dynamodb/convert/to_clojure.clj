@@ -17,7 +17,10 @@
                   [(to-dashed k) (convert-value type-conversions v)]) m)))
 
 (defn prepare-fn [type-conversions maps-to-convert & [values-to-convert]]
-  (let [cm (partial convert-map type-conversions)
+  (let [convert-map (partial convert-map type-conversions)
+        cm (fn [value] (if (sequential? value)
+                         (map convert-map value)
+                         (convert-map value)))
         cv (partial convert-value type-conversions)
         maps-to-convert (set maps-to-convert)
         values-to-convert (set values-to-convert)]
