@@ -109,9 +109,12 @@
 (defn remove-host-header [request]
   (update-in request [:headers] dissoc "host"))
 
-(defn basic-get-item-request [table-name hash-key]
+(defn basic-get-item-request [table-name hash-key & [range-key]]
   (let [body {:table-name table-name
-              :key {:hash-key-element hash-key}}]
+              :key (if range-key
+                     {:hash-key-element hash-key
+                      :range-key-element range-key}
+                     {:hash-key-element hash-key})}]
     (-> basic-request
         (assoc :body body)
         (add-target :get-item))))
