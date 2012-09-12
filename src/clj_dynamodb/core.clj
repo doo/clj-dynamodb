@@ -302,3 +302,13 @@
                          prepare-request
                          (basic-batch-get-item-request
                           (batch-get-request table-name keys))))))
+
+(defn basic-delete-item-request [table-name hash-key & [range-key]]
+  (let [body {:table-name table-name
+              :key (if range-key
+                     {:hash-key-element hash-key
+                      :range-key-element range-key}
+                     {:hash-key-element hash-key})}]
+    (-> basic-request
+        (assoc :body body)
+        (add-target :delete-item))))
