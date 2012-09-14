@@ -217,17 +217,31 @@
      #(assoc response :body %))
     response))
 
-(def http-request
+(defn- http-request-keep-state [request]
+  (let [state (:state request)
+        result-ch (r/result-channel)
+        response-ch (a/http-request request)]
+    (l/on-realized response-ch
+                   (fn [response]
+                     (let [response (if state
+                                      (assoc response :state state)
+                                      response)]
+                       (l/success result-ch response)))
+                   (fn [error]
+                     (l/error result-ch error)))
+    result-ch))
+
+(def internal-http-request
   (l/pipeline
    remove-host-header
    delay-request
-   a/http-request
+   http-request-keep-state
    handle-chunked-transfer-encoding
    body-to-string))
 
-(def http-execute-with-exponential-backoff
+(def http-request
   (l/pipeline
-   (fn [request] (l/merge-results request (http-request request)))
+   (fn [request] (l/merge-results request (internal-http-request request)))
    (fn [[request response]]
      (let [aws (:aws request)
            n (:request-retries aws 0)
@@ -246,7 +260,7 @@
 (defn batch-pipeline [prepare-request]
   (l/pipeline
    (fn [request] (prepare-request request))
-   http-execute-with-exponential-backoff))
+   http-request))
 
 (defn repeat-unprocessed-pipeline [extract-unprocessed create-repeat-request]
   (fn [response]
@@ -256,7 +270,9 @@
        ;;(println "unprocessed" unprocessed-items) ;;TODO replace through lamina trace
        (if (empty? unprocessed)
          response
-         (l/restart (create-repeat-request unprocessed))))))
+         (l/restart (update-in (create-repeat-request unprocessed)
+                               [:state :previous-responses]
+                               #(conj (or % []) response)))))))
 
 (defn batch-write-items [prepare-request batch-write-item-request]
   (l/run-pipeline
@@ -295,13 +311,29 @@
                          prepare-request
                          (basic-batch-write-item-request batch)))))
 
+(defn- extract-previous-responses [response]
+  (if-let [previous-responses (get-in response [:state :previous-responses])]
+    (concat previous-responses
+            [(update-in response [:state] dissoc :previous-responses)])
+    response))
+
+(defn- post-process-batch-get-items-responses [responses]
+  (flatten (map extract-previous-responses responses)))
+
 (defn mass-batch-get-items [prepare-request table-name keys]
-  (mass-batch-execute (partition-all dynamodb-batch-get-size keys)
-                      (fn [keys]
-                        (batch-get-items
-                         prepare-request
-                         (basic-batch-get-item-request
-                          (batch-get-request table-name keys))))))
+  (let [response-ch (mass-batch-execute (partition-all dynamodb-batch-get-size keys)
+                                        (fn [keys]
+                                          (batch-get-items
+                                           prepare-request
+                                           (basic-batch-get-item-request
+                                            (batch-get-request table-name keys)))))
+        result-ch (r/result-channel)]
+    (l/on-realized response-ch
+                   (fn [responses]
+                     (l/success result-ch (post-process-batch-get-items-responses responses)))
+                   (fn [error]
+                     (l/error result-ch error)))
+    result-ch))
 
 (defn basic-delete-item-request [table-name hash-key & [range-key]]
   (let [body {:table-name table-name
