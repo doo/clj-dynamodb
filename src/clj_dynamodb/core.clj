@@ -313,8 +313,8 @@
 
 (defn- extract-previous-responses [response]
   (if-let [previous-responses (get-in response [:state :previous-responses])]
-    (concat previous-responses
-            [(update-in response [:state] dissoc :previous-responses)])
+    (cons (update-in response [:state] dissoc :previous-responses)
+          (map extract-previous-responses previous-responses))
     response))
 
 (defn- post-process-batch-get-items-responses [responses]
