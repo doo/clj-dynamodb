@@ -59,13 +59,17 @@
 (defn to-dynamodb-request-body [req]
   (update-in req [:body] to-dynamodb))
 
+(defn basic-prepare-request [request]
+  (-> request
+      (update-in [:body] json/generate-string)
+      use-endpoint
+      signature/sign-request))
+
 (defn default-prepare-request [req aws-params]
   (-> req
       to-dynamodb-request-body
-      (update-in [:body] json/generate-string)
       (add-aws aws-params)
-      use-endpoint
-      signature/sign-request))
+      basic-prepare-request))
 
 (defn to-clojure [body]
   (convert-body string? to-dashed (clj/prepare-fn clj/type-conversions #{"Item" "Items"}) body))
@@ -344,3 +348,33 @@
     (-> basic-request
         (assoc :body body)
         (add-target :delete-item))))
+
+(defn delete-table-request [table-name]
+  (-> basic-request
+      (assoc :body {:table-name table-name})
+      (add-target :delete-table)))
+
+(defonce ^:dynamic *aws-params* nil)
+
+(defn set-aws-params [aws-params]
+  (alter-var-root #'*aws-params* (constantly aws-params)))
+
+(defn convert-keywords [request]
+  (update-in request [:body] #(convert-body keyword? to-camel-case (constantly nil) %)))
+
+(defn default-http-request [request]
+  @(http-request (basic-prepare-request
+                  (convert-keywords
+                   (assoc request :aws *aws-params*)))))
+
+;;TODO: add error handling
+(defn delete-table [table-name]
+  (default-http-request (delete-table-request table-name)))
+
+(defn create-table-request [config]
+  (-> basic-request
+      (assoc :body config)
+      (add-target :create-table)))
+
+(defn create-table [config]
+  (default-http-request (create-table-request config)))
