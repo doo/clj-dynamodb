@@ -137,6 +137,12 @@
       (assoc-in r [:put-request :id] id)
       r)))
 
+(defn batch-delete-request [hash-key & [range-key]]
+  (let [r {:delete-request {:key {:hash-key-element hash-key}}}]
+    (if range-key
+      (assoc-in r [:delete-request :key :range-key-element] range-key)
+      r)))
+
 (defn basic-batch-write-item-request [batch-request-items]
   (-> basic-request
       (assoc :body {:request-items batch-request-items})
