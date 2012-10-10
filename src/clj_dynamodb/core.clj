@@ -241,8 +241,15 @@
                      (l/error result-ch error)))
     result-ch))
 
+(def default-netty-client-options
+  {"connectTimeoutMillis" (* 50 1000)})
+
+(defn add-default-netty-client-options [request]
+  (update-in request [:netty :options] #(merge default-netty-client-options %)))
+
 (def internal-http-request
   (l/pipeline
+   add-default-netty-client-options
    remove-host-header
    delay-request
    http-request-keep-state
