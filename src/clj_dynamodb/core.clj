@@ -6,7 +6,8 @@
             [aws-signature-v4.signing :as signature]
             [lamina.core.result :as r]
             [lamina.core :as l]
-            [aleph.http :as a])
+            [aleph.http :as a]
+            [clj-dynamodb.connection-pool :as pool])
   (:import org.jboss.netty.buffer.ChannelBufferInputStream))
 
 (def ^:dynamic dynamodb-api-version "DynamoDB_20111205")
@@ -39,8 +40,11 @@
 (defn add-aws [req aws-params]
   (assoc req :aws aws-params))
 
+(defn extract-endpoint [req]
+  (get-in req [:aws :endpoint]))
+
 (defn use-endpoint [req]
-  (assoc req :server-name (get-in req [:aws :endpoint])))
+  (assoc req :server-name (extract-endpoint req)))
 
 (defn add-target [req target]
   (assoc-in req [:headers "x-amz-target"] (amz-target target)))
@@ -230,14 +234,18 @@
 (defn- http-request-keep-state [request]
   (let [state (:state request)
         result-ch (r/result-channel)
-        response-ch (a/http-request request)]
+        http-client-connection-pool (pool/get-http-client-connection-pool request)
+        http-client (.borrowObject http-client-connection-pool)
+        response-ch (http-client request)]
     (l/on-realized response-ch
                    (fn [response]
+                     (.returnObject http-client-connection-pool http-client)
                      (let [response (if state
                                       (assoc response :state state)
                                       response)]
                        (l/success result-ch response)))
                    (fn [error]
+                     (.invalidateObject http-client-connection-pool http-client)
                      (l/error result-ch error)))
     result-ch))
 
