@@ -79,7 +79,7 @@
 
 (defn parse-body [request-or-response]
   (update-in request-or-response [:body]
-             #(json/parse-string (String. %))))
+             json/parse-string))
 
 (defn default-prepare-response [response]
   (-> response
